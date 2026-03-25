@@ -1,142 +1,166 @@
-# PyTorch DDP Baseline (Distributed Training)
+# Batch vs Real-Time Inference Patterns (Distributed ML Systems)
 
-## Why this artifact matters
+## Why this decision matters
 
-DistributedDataParallel (DDP) is the practical default for multi-GPU training in PyTorch.
-For ML Engineer / MLOps roles, interviewers expect you to understand not just model code, but process topology, synchronization costs, and reliability/debug patterns.
+Inference architecture is a product and systems decision, not just an ML decision.
+Choosing the wrong pattern causes either unnecessary latency/cost or stale predictions that hurt business outcomes.
 
-This note focuses on an implementation you can run locally and explain confidently.
-
----
-
-## 1) DDP mental model
-
-Core terms:
-
-- **world size**: total number of training processes
-- **rank**: unique process id in `[0, world_size-1]`
-- **local rank**: GPU index within one machine
-- **global batch size**: `per_device_batch * world_size`
-
-How DDP works:
-
-1. each rank has a full model replica
-2. each rank processes a different mini-batch shard
-3. gradients are all-reduced across ranks during backward
-4. optimizer step runs locally but stays in sync due to reduced grads
+For Grab-like environments, you usually need to optimize for both user-facing latency and fleet-scale compute efficiency.
 
 ---
 
-## 2) Correct baseline setup
+## 1) Pattern definitions
 
-Must-have steps:
+## A) Batch inference
 
-1. initialize process group (`torch.distributed.init_process_group`)
-2. set device by local rank
-3. wrap model with `DistributedDataParallel`
-4. use `DistributedSampler` for dataset sharding
-5. call `sampler.set_epoch(epoch)` every epoch
-6. only rank 0 handles checkpointing/logging outputs
-7. cleanly destroy process group on exit
+- score large datasets on a schedule (hourly/daily/etc.)
+- write predictions to storage/cache for downstream consumption
 
-Launch pattern:
+Typical use cases:
+- risk pre-screening
+- demand forecasting snapshots
+- offline ranking feature generation
 
-- `torchrun --standalone --nproc_per_node=2 distributed-training/train_ddp.py`
+## B) Real-time inference
 
----
+- request-time prediction with strict latency budgets (e.g., p95 < 100 ms)
+- fetch fresh features and run model online per request
 
-## 3) Common failure/debug paths
+Typical use cases:
+- ETA personalization
+- dynamic pricing adjustments
+- checkout fraud decisions
 
-### A) Hangs/deadlocks
+## C) Hybrid inference (common production pattern)
 
-Typical causes:
+- precompute heavy/stable components in batch
+- combine with fresh request-time signals online
 
-- one rank exits early while others wait in collective op
-- inconsistent batch counts across ranks
-- missing `sampler.set_epoch` or bad dataloader settings
-
-Debug approach:
-
-- set `TORCH_DISTRIBUTED_DEBUG=DETAIL`
-- reduce workers/batch size and run minimal config
-- ensure every rank executes same training loop shape
-
-### B) NCCL init/runtime errors
-
-Typical causes:
-
-- incompatible CUDA/NCCL versions
-- wrong network interface
-- GPU visibility mismatch
-
-Useful env flags:
-
-- `NCCL_DEBUG=INFO`
-- `NCCL_IB_DISABLE=1` (when RDMA path is broken)
-- `NCCL_SOCKET_IFNAME=eth0` (or your correct interface)
-
-### C) Uneven performance
-
-Typical causes:
-
-- CPU dataloader bottleneck
-- too-small per-rank batch
-- heavy host-device sync points in loop
+Typical use case:
+- ranking: precomputed user/item embeddings + real-time context features
 
 ---
 
-## 4) Performance checklist (high ROI)
+## 2) Decision framework
 
-1. Increase per-rank batch until memory limit
-2. Enable AMP (`torch.cuda.amp.autocast` + `GradScaler`)
-3. Tune dataloader (`num_workers`, `pin_memory`, `persistent_workers`)
-4. Minimize Python-side logging/sync in hot loop
-5. Profile dataloader vs compute time before model-level tuning
-6. Save checkpoints less frequently and only on rank 0
+Evaluate each use case along these axes:
 
----
-
-## 5) Reliability checklist
-
-- deterministic seed strategy per rank
-- checkpoint contains:
-- model state
-- optimizer state
-- scaler state (if AMP)
-- epoch/step counters
-- rank 0 writes checkpoints atomically (tmp file + rename)
-- fail-fast on NaN/Inf loss
-- preserve run metadata (commit hash, config, world size)
+1. **Latency SLO**
+- if strict sub-second user path -> real-time or hybrid
+2. **Feature freshness requirement**
+- if stale features degrade value quickly -> real-time component required
+3. **Traffic shape**
+- high sustained QPS can favor batch precompute + cache
+4. **Cost envelope**
+- real-time often costs more due to overprovisioning and low tail-latency constraints
+5. **Failure tolerance**
+- batch degrades gracefully (older outputs), real-time requires strong fallback paths
+6. **Business impact of staleness**
+- if wrong/stale predictions are expensive, invest in online serving and drift monitoring
 
 ---
 
-## 6) What to measure and report
+## 3) Tradeoffs at a glance
 
-System metrics:
+### Batch strengths
+- cheaper per prediction at scale
+- operationally simpler serving path
+- easier reproducibility and audit trails
 
-- samples/sec per rank
-- global samples/sec
-- GPU utilization
-- dataloader wait time
-- step time variance across ranks
+### Batch weaknesses
+- stale outputs between runs
+- limited personalization to latest context
+- poor fit for tight user-interaction loops
 
-Training metrics:
+### Real-time strengths
+- freshest context and personalization
+- immediate adaptation to changing state
+- better for interactive decisioning
 
-- loss curve consistency vs single-GPU baseline
-- convergence per wall-clock hour
-- final accuracy/performance parity check
-
-For portfolio quality, include before/after numbers for at least one tuning change.
+### Real-time weaknesses
+- higher infra and on-call complexity
+- strict latency/reliability engineering required
+- expensive autoscaling and tail-latency mitigation
 
 ---
 
-## 7) Scope and next upgrades
+## 4) Failure modes and mitigation
 
-This baseline is intentionally minimal and local-first.
+## Batch failure modes
+- delayed pipelines -> stale predictions
+- partial recompute -> inconsistent snapshots
 
-Good follow-ups:
+Mitigations:
+- data freshness SLO alerts
+- atomic snapshot publish
+- fallback to previous known-good snapshot
 
-- multi-node DDP with explicit rendezvous config
-- experiment tracking integration (MLflow/W&B)
-- fault-tolerant checkpoint resume in orchestrated jobs
-- FSDP/ZeRO comparison for larger models
+## Real-time failure modes
+- model server timeout/overload
+- feature store latency spikes
+- cascading dependency failures
+
+Mitigations:
+- request timeout budgets + circuit breakers
+- cached fallback features/predictions
+- graceful degradation policy (heuristics/default model)
+- shadow canary before full rollout
+
+---
+
+## 5) Cost and capacity considerations
+
+Batch:
+- optimize for throughput (large jobs, spot/preemptible where safe)
+- run off-peak when possible
+
+Real-time:
+- optimize for p95/p99 latency
+- account for peak burst headroom and multi-AZ redundancy
+- cost grows with strict SLO + underutilized reserve capacity
+
+Hybrid often wins:
+- heavy feature transforms done offline
+- smaller online model footprint reduces latency and cost
+
+---
+
+## 6) Recommended pattern choices (practical rules)
+
+Use **batch** when:
+- decision tolerance is minutes/hours
+- prediction consumes large cohorts, not individual requests
+
+Use **real-time** when:
+- user or transaction context changes quickly
+- stale prediction materially harms UX/revenue/risk
+
+Use **hybrid** when:
+- you need near-real-time quality but cannot afford full online recomputation
+- model has expensive stable features + lightweight dynamic features
+
+---
+
+## 7) MLOps operating checklist
+
+Before launching any inference pattern, define:
+
+- latency SLO (p50/p95/p99)
+- freshness SLO (max acceptable feature/prediction age)
+- error budget and fallback behavior
+- drift monitoring and retraining trigger
+- rollout strategy (shadow -> canary -> gradual ramp)
+- rollback playbook with explicit owner and alert thresholds
+
+---
+
+## 8) What to prioritize for portfolio impact
+
+For ML Engineer/MLOps interviews, show that you can:
+
+1. justify pattern choice with business/SLO constraints
+2. design fallback and degradation behavior
+3. quantify latency-freshness-cost tradeoffs
+4. instrument reliability and model quality in production
+
+That signals production readiness far better than model metrics alone.
